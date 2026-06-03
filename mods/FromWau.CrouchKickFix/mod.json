@@ -1,10 +1,23 @@
 {
-    "Name": "Crouch Kick Fix",
-    "Description": "Automatically enables the 8ms crouch kick input buffer with visual confirmation",
-    "Version": "1.0.0",
+    "Name": "FromWau.CrouchKickFix",
+    "Description": "8ms crouch-kick input buffer (native plugin). Buffers jump/crouch presses so crouch kicks register consistently. No midimap.dll needed. Configurable via Mod Settings.",
+    "Version": "2.0.0",
     "LoadPriority": 1,
+    "Authors": ["FromWau"],
+
+    "ConVars": [
+        { "Name": "ckf_enabled", "DefaultValue": "1", "Flags": 16777232 },
+        { "Name": "ckf_ui_feedback", "DefaultValue": "1", "Flags": 16777232 }
+    ],
 
     "Scripts": [
+        {
+            "Path": "ckf_settings.nut",
+            "RunOn": "CLIENT || UI",
+            "UICallback": {
+                "Before": "CrouchKickFix_Settings"
+            }
+        },
         {
             "Path": "init_crouchkick.nut",
             "RunOn": "CLIENT",

@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/crouchkick-core", "crates/crouchkick-plugin"]
+resolver = "2"

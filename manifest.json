@@ -1,7 +1,10 @@
 {
     "name": "CrouchKickFix",
-    "version_number": "1.0.0",
-    "description": "Adds an 8ms input buffer for crouch kicks, making them easier to execute consistently",
+    "version_number": "2.0.0",
+    "description": "8ms crouch-kick input buffer (native plugin, no midimap.dll). Buffers jump + crouch so crouch kicks land consistently. In-game kick feedback + Mod Settings menu. Port of the TF2SR / FzzyMod fix.",
     "website_url": "https://github.com/FromWau/CrouchKickFix",
-    "dependencies": []
+    "dependencies": [
+        "northstar-Northstar-1.0.0",
+        "EladNLG-ModSettings-2.1.0"
+    ]
 }

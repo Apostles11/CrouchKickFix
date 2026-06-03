@@ -1,0 +1,15 @@
+[package]
+name = "crouchkick-plugin"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+crouchkick-core = { path = "../crouchkick-core" }
+tf2-input = { git = "https://github.com/FromWau/tf2-input-lib.git", tag = "v0.1.0" }
+rrplug = "4.3"
+retour = { version = "0.3", default-features = false }
+log = "0.4"
+winapi = { version = "0.3", features = ["libloaderapi"] }
