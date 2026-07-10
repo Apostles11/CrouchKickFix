@@ -79,10 +79,6 @@ static LAST_JD: AtomicBool = AtomicBool::new(false);
 static LAST_CD: AtomicBool = AtomicBool::new(false);
 
 
-// 临时调试：进入地图后由 Rust 主动推送一次 HUD。
-static DEBUG_FEEDBACK_SENT: AtomicBool = AtomicBool::new(false);
-static DEBUG_PLAYER_FRAMES: AtomicU32 = AtomicU32::new(0);
-
 
 // The buffer (the fix); pushed from the companion via CKF_SetOptions (ModSettings `ckf_enabled`).
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -514,22 +510,6 @@ impl Plugin for CrouchKickFix {
     }
 
 
-        // 临时测试 native DLL -> CLIENT Squirrel -> CKF_OnKick。
-        // 检测到本地玩家后等待约 120 帧，再主动推送一次 +120 u/s。
-        if local_player().is_some()
-            && !DEBUG_FEEDBACK_SENT.load(Ordering::Relaxed)
-        {
-            let frames = DEBUG_PLAYER_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-
-            if frames >= 120
-            {
-                log::info!("debug: native feedback test");
-        
-                push_kick(t, 120, 1, true);
-
-                DEBUG_FEEDBACK_SENT.store(true, Ordering::Relaxed);
-            }
-        }
 
         // Wall contact this frame, from the RE'd wall-run flag.
         let wr = is_wallrunning();
@@ -646,7 +626,6 @@ impl Plugin for CrouchKickFix {
             }
 
             push_kick(t, gain, wall_frame, crouch);
-        }
         }
     }
 }
