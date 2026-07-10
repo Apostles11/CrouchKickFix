@@ -60,6 +60,12 @@ const BIND_RETRY_INTERVAL: u64 = 64;
 
 static BINDS_READY: AtomicBool = AtomicBool::new(false);
 
+
+// 临时调试：进入地图后由 Rust 主动推送一次 HUD。
+static DEBUG_FEEDBACK_SENT: AtomicBool = AtomicBool::new(false);
+static DEBUG_PLAYER_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+
 // The buffer (the fix); pushed from the companion via CKF_SetOptions (ModSettings `ckf_enabled`).
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -328,9 +334,43 @@ fn ckf_set_options(enabled: i32) {
 /// Push a detected kick into the CLIENT VM by calling the companion's `CKF_OnKick`. Must run on
 /// the engine thread (called from runframe). No-op if the client VM / function isn't ready.
 fn push_kick(t: EngineToken, gain: i32, wall_frame: i32, crouch: bool) {
-    let Some(sqvm) = *SQVM_CLIENT.get(t).borrow() else { return };
-    let Some(sqfns) = SQFUNCTIONS.client.get() else { return };
-    let _ = call_sq_function::<(), _>(sqvm, sqfns, "CKF_OnKick", (gain, wall_frame, crouch as i32));
+    let Some(sqvm) = *SQVM_CLIENT.get(t).borrow() else {
+        log::warn!(
+            "crouch-kick: feedback push failed — CLIENT Squirrel VM unavailable"
+        );
+        return;
+    };
+
+    let Some(sqfns) = SQFUNCTIONS.client.get() else {
+        log::warn!(
+            "crouch-kick: feedback push failed — CLIENT SQFUNCTIONS unavailable"
+        );
+        return;
+    };
+
+    log::info!(
+        "crouch-kick: pushing feedback gain={} wall_frame={} crouch={}",
+        gain,
+        wall_frame,
+        crouch
+    );
+
+    let result = call_sq_function::<(), _>(
+        sqvm,
+        sqfns,
+        "CKF_OnKick",
+        (gain, wall_frame, crouch as i32),
+    );
+
+    if result.is_err() {
+        log::error!(
+            "crouch-kick: CKF_OnKick Squirrel call failed"
+        );
+    } else {
+        log::info!(
+            "crouch-kick: CKF_OnKick Squirrel call succeeded"
+        );
+    }
 }
 
 pub struct CrouchKickFix;
@@ -369,6 +409,24 @@ impl Plugin for CrouchKickFix {
             {
                 BINDS_READY.store(true, Ordering::Relaxed);
                 log::info!("crouch-kick: input binds resolved");
+            }
+        }
+
+
+        // 临时测试 native DLL -> CLIENT Squirrel -> CKF_OnKick。
+        // 检测到本地玩家后等待约 120 帧，再主动推送一次 +120 u/s。
+        if local_player().is_some()
+            && !DEBUG_FEEDBACK_SENT.load(Ordering::Relaxed)
+        {
+            let frames = DEBUG_PLAYER_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+
+            if frames >= 120
+            {
+                log::info!("debug: native feedback test");
+        
+                push_kick(t, 120, 1, true);
+
+                DEBUG_FEEDBACK_SENT.store(true, Ordering::Relaxed);
             }
         }
 
