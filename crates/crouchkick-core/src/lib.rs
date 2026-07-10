@@ -9,7 +9,7 @@
 //! plugin maps engine `PostEvent` args ↔ these abstract events and does re-emission.
 
 /// FzzyMod `CROUCHKICK_BUFFERING` (milliseconds).
-pub const BUFFER_MS: u64 = 1000;
+pub const BUFFER_MS: u64 = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Btn {
@@ -89,23 +89,32 @@ impl Buffer {
         Decision::Hold
     }
 
-    /// Per-Update tick: return the held events whose window has elapsed (the plugin
-    /// re-emits each). Clears them from the held set.
+    /// Per-Update tick: return held events whose buffering window has elapsed.
+    ///
+    /// Events are returned in their original chronological order. This matters when
+    /// multiple events expire between two update ticks, because fixed button/edge
+    /// iteration order could otherwise reverse the player's actual input order.
     pub fn on_update(&mut self, now_ms: u64) -> Vec<(Btn, Edge)> {
-        let mut out = Vec::new();
-        for (btn, bi) in [(Btn::Jump, 0usize), (Btn::Crouch, 1)] {
-            for (edge, ei) in [(Edge::Press, 0usize), (Edge::Release, 1)] {
+        let mut due: Vec<(u64, Btn, Edge)> = Vec::new();
+
+        for (btn, bi) in [(Btn::Jump, 0usize), (Btn::Crouch, 1usize)] {
+            for (edge, ei) in [(Edge::Press, 0usize), (Edge::Release, 1usize)] {
                 if let Some(ts) = self.held[bi][ei] {
                     if now_ms.saturating_sub(ts) > BUFFER_MS {
                         self.held[bi][ei] = None;
-                        out.push((btn, edge));
+                        due.push((ts, btn, edge));
                     }
                 }
             }
         }
-        out
+
+        // At most four events can be present, so this sort has negligible cost.
+        due.sort_by_key(|(ts, _, _)| *ts);
+
+        due.into_iter()
+            .map(|(_, btn, edge)| (btn, edge))
+            .collect()
     }
-}
 
 #[cfg(test)]
 mod tests {
