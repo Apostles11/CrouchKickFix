@@ -78,7 +78,9 @@ static LAST_WR: AtomicBool = AtomicBool::new(false);
 static LAST_JD: AtomicBool = AtomicBool::new(false);
 static LAST_CD: AtomicBool = AtomicBool::new(false);
 
-
+// 临时诊断：限制原始输入日志数量，防止日志无限增长。
+static RAW_INPUT_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+const RAW_INPUT_LOG_LIMIT: u32 = 200;
 
 // The buffer (the fix); pushed from the companion via CKF_SetOptions (ModSettings `ckf_enabled`).
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -279,6 +281,26 @@ unsafe extern "C" fn post_event_detour(
     };
     let pass = |ctx: usize| unsafe { detour.call(ctx, n_type, n_tick, scan, virt, data3) };
 
+    let is_button_event =
+        n_type == IE_BUTTON_PRESSED
+        || n_type == IE_BUTTON_RELEASED;
+
+    if DEBUG_DETECTOR && is_button_event {
+        let index =
+            RAW_INPUT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        if index < RAW_INPUT_LOG_LIMIT {
+            log::info!(
+                "crouch-kick raw input: \
+                 type={}, tick={}, scan={}, virt={}, data3={}",
+                n_type,
+                n_tick,
+                scan,
+                virt,
+                data3
+            );
+        }
+    }
     // Feed physical key state to tf2-input (it tracks held-state by ButtonCode; kick detection
     // reads is_down() by action in runframe — the press edges rarely coincide with the brief
     // wall contact, but the held state does).
