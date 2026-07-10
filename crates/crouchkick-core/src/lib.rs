@@ -9,7 +9,7 @@
 //! plugin maps engine `PostEvent` args ↔ these abstract events and does re-emission.
 
 /// FzzyMod `CROUCHKICK_BUFFERING` (milliseconds).
-pub const BUFFER_MS: u64 = 8;
+pub const BUFFER_MS: u64 = 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Btn {
