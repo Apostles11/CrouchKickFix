@@ -1,0 +1,102 @@
+name: Build CrouchKick DLL
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Cross-compile Windows DLL
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # 获取当前仓库源码
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # 安装仓库 .cargo/config.toml 所要求的 MinGW 链接器和归档工具
+      - name: Install MinGW toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-mingw-w64-x86-64 \
+            binutils-mingw-w64-x86-64
+
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-ar --version
+
+      # 安装并选择稳定版 Rust，再添加 Windows GNU 编译目标
+      - name: Configure Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-gnu
+
+          rustc --version
+          cargo --version
+
+      # 只编译原生插件 crate
+      - name: Build crouchkick plugin
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --package crouchkick-plugin \
+            --target x86_64-pc-windows-gnu
+
+      # 确认 DLL 确实生成
+      - name: Verify DLL
+        run: |
+          DLL_PATH="target/x86_64-pc-windows-gnu/release/crouchkick_plugin.dll"
+
+          if [ ! -f "$DLL_PATH" ]; then
+            echo "ERROR: crouchkick_plugin.dll was not generated."
+            exit 1
+          fi
+
+          ls -lh "$DLL_PATH"
+          file "$DLL_PATH"
+
+      # 按照 Thunderstore/Northstar 包结构整理完整模组
+      - name: Prepare mod package
+        run: |
+          PACKAGE="dist/FromWau-CrouchKickFix-2.0.0"
+
+          mkdir -p "$PACKAGE/plugins"
+          mkdir -p "$PACKAGE/mods"
+
+          cp \
+            target/x86_64-pc-windows-gnu/release/crouchkick_plugin.dll \
+            "$PACKAGE/plugins/"
+
+          cp -r \
+            mods/FromWau.CrouchKickFix \
+            "$PACKAGE/mods/"
+
+          cp manifest.json "$PACKAGE/"
+
+          if [ -f icon.png ]; then
+            cp icon.png "$PACKAGE/"
+          fi
+
+          if [ -f README.md ]; then
+            cp README.md "$PACKAGE/"
+          fi
+
+          if [ -f LICENSE ]; then
+            cp LICENSE "$PACKAGE/"
+          fi
+
+          find "$PACKAGE" -maxdepth 4 -type f -print
+
+      # 上传为可下载的构建产物
+      - name: Upload compiled mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: FromWau-CrouchKickFix-2.0.0
+          path: dist/FromWau-CrouchKickFix-2.0.0
+          if-no-files-found: error
+          retention-days: 7
