@@ -54,8 +54,11 @@ const POST_LEAVE_FRAMES: u32 = 5;
 // frames in with no jump => a sustained wallrun, not a kick: abandon the contact.
 const MAX_KICK_WALL_FRAMES: u32 = 25;
 
-// Re-resolve binds every this many runframes (picks up live rebinds cheaply).
-const BIND_REFRESH_INTERVAL: u64 = 64;
+// 按键表尚未准备好时，每隔 64 帧重试一次。
+// 第一次成功后停止周期扫描，避免在游戏线程上产生规律性卡顿。
+const BIND_RETRY_INTERVAL: u64 = 64;
+
+static BINDS_READY: AtomicBool = AtomicBool::new(false);
 
 // The buffer (the fix); pushed from the companion via CKF_SetOptions (ModSettings `ckf_enabled`).
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -357,9 +360,16 @@ impl Plugin for CrouchKickFix {
             flush();
         }
 
-        // Re-resolve jump/crouch binds from the engine periodically, so live rebinds are picked up.
-        if tick % BIND_REFRESH_INTERVAL == 0 {
-            tf2_input::refresh();
+        // 启动阶段持续尝试读取按键绑定。
+        // 一旦成功，就停止周期性扫描，避免每 64 帧在游戏线程执行大量 VirtualQuery。
+        if !BINDS_READY.load(Ordering::Relaxed)
+            && tick % BIND_RETRY_INTERVAL == 0
+        {    
+            if tf2_input::refresh()
+            {
+                BINDS_READY.store(true, Ordering::Relaxed);
+                log::info!("crouch-kick: input binds resolved");
+            }
         }
 
         // Wall contact this frame, from the RE'd wall-run flag.
