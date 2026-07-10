@@ -54,11 +54,29 @@ const POST_LEAVE_FRAMES: u32 = 5;
 // frames in with no jump => a sustained wallrun, not a kick: abandon the contact.
 const MAX_KICK_WALL_FRAMES: u32 = 25;
 
-// 按键表尚未准备好时，每隔 64 帧重试一次。
-// 第一次成功后停止周期扫描，避免在游戏线程上产生规律性卡顿。
+// 启动阶段快速重试按键解析。
 const BIND_RETRY_INTERVAL: u64 = 64;
 
+// 连续失败较多次后降低刷新频率，避免再次产生周期性卡顿。
+const BIND_SLOW_RETRY_INTERVAL: u64 = 3600;
+
+// 前 20 次使用快速重试。
+const BIND_FAST_RETRY_LIMIT: u32 = 20;
+
+// Source 引擎 ButtonCode 的检查范围。
+const BUTTON_CODE_SCAN_LIMIT: i32 = 256;
+
+// 临时诊断开关。排查完成后改为 false。
+const DEBUG_DETECTOR: bool = true;
+
 static BINDS_READY: AtomicBool = AtomicBool::new(false);
+static BIND_RETRY_COUNT: AtomicU32 = AtomicU32::new(0);
+static NEXT_BIND_RETRY_TICK: AtomicU64 = AtomicU64::new(0);
+
+// 记录上一帧状态，只在状态发生变化时输出日志。
+static LAST_WR: AtomicBool = AtomicBool::new(false);
+static LAST_JD: AtomicBool = AtomicBool::new(false);
+static LAST_CD: AtomicBool = AtomicBool::new(false);
 
 
 // 临时调试：进入地图后由 Rust 主动推送一次 HUD。
@@ -82,6 +100,42 @@ fn is_jump_key(scan: i32) -> bool {
 }
 fn is_crouch_key(scan: i32) -> bool {
     tf2_input::matches(Input::Crouch, scan) || tf2_input::matches(Input::ToggleCrouch, scan)
+}
+
+/// 检查绑定表中是否确实存在：
+/// 1. 至少一个 Jump 绑定；
+/// 2. 至少一个 Crouch 或 ToggleCrouch 绑定。
+///
+/// 成功时返回对应的 ButtonCode。
+fn find_required_binds() -> Option<(i32, i32)> {
+    let mut jump_key: Option<i32> = None;
+    let mut crouch_key: Option<i32> = None;
+
+    for code in 0..BUTTON_CODE_SCAN_LIMIT {
+        if jump_key.is_none()
+            && tf2_input::matches(Input::Jump, code)
+        {
+            jump_key = Some(code);
+        }
+
+        if crouch_key.is_none()
+            && (
+                tf2_input::matches(Input::Crouch, code)
+                || tf2_input::matches(Input::ToggleCrouch, code)
+            )
+        {
+            crouch_key = Some(code);
+        }
+
+        if jump_key.is_some() && crouch_key.is_some() {
+            break;
+        }
+    }
+
+    match (jump_key, crouch_key) {
+        (Some(jump), Some(crouch)) => Some((jump, crouch)),
+        _ => None,
+    }
 }
 
 // Consecutive frames currently wall-running (0 = not on wall; 1 = first wall frame).
@@ -400,17 +454,64 @@ impl Plugin for CrouchKickFix {
             flush();
         }
 
-        // 启动阶段持续尝试读取按键绑定。
-        // 一旦成功，就停止周期性扫描，避免每 64 帧在游戏线程执行大量 VirtualQuery。
-        if !BINDS_READY.load(Ordering::Relaxed)
-            && tick % BIND_RETRY_INTERVAL == 0
-        {    
-            if tf2_input::refresh()
-            {
-                BINDS_READY.store(true, Ordering::Relaxed);
-                log::info!("crouch-kick: input binds resolved");
+    // 只在进入地图、能够解析本地玩家之后读取绑定表。
+    // refresh() 返回 true 后，还需要确认 Jump/Crouch 已实际解析。
+    let player_available = local_player().is_some();
+
+    if !BINDS_READY.load(Ordering::Relaxed)
+        && player_available
+    {
+        let next_retry_tick =
+            NEXT_BIND_RETRY_TICK.load(Ordering::Relaxed);
+
+        if tick >= next_retry_tick {
+            let attempt =
+                BIND_RETRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+
+            let next_interval =
+                if attempt < BIND_FAST_RETRY_LIMIT {
+                    BIND_RETRY_INTERVAL
+                } else {
+                    BIND_SLOW_RETRY_INTERVAL
+                };
+
+            NEXT_BIND_RETRY_TICK.store(
+                tick.saturating_add(next_interval),
+                Ordering::Relaxed,
+            );
+
+            let table_readable = tf2_input::refresh();
+
+            if table_readable {
+                if let Some((jump_key, crouch_key)) =
+                    find_required_binds()
+                {
+                    BINDS_READY.store(true, Ordering::Relaxed);
+
+                    log::info!(
+                        "crouch-kick: required binds resolved; \
+                         jump_code={}, crouch_code={}, attempts={}",
+                        jump_key,
+                        crouch_key,
+                        attempt
+                    );
+                } else if attempt <= 5 || attempt % 10 == 0 {
+                    log::warn!(
+                        "crouch-kick: bind table readable, \
+                         but Jump/Crouch bindings are missing; \
+                         attempt={}",
+                        attempt
+                    );
+                }
+            } else if attempt <= 5 || attempt % 10 == 0 {
+                log::warn!(
+                    "crouch-kick: input bind table not ready; \
+                     attempt={}",
+                    attempt
+                );
             }
         }
+    }
 
 
         // 临时测试 native DLL -> CLIENT Squirrel -> CKF_OnKick。
@@ -442,6 +543,45 @@ impl Plugin for CrouchKickFix {
         let jd = jump_down();
         let cd = crouch_down();
         let spd = horiz_speed().unwrap_or(0.0);
+
+        // 只在状态变化时记录，避免每帧刷日志。
+        if DEBUG_DETECTOR {
+            let old_wr = LAST_WR.swap(wr, Ordering::Relaxed);
+            let old_jd = LAST_JD.swap(jd, Ordering::Relaxed);
+            let old_cd = LAST_CD.swap(cd, Ordering::Relaxed);
+
+            if old_wr != wr || old_jd != jd || old_cd != cd {
+                log::info!(
+                    "crouch-kick state changed: \
+                     wallrun={}, wall_frames={}, \
+                     jump={}, crouch={}, speed={:.1}, \
+                     binds_ready={}",
+                    wr,
+                    wf,
+                    jd,
+                    cd,
+                    spd,
+                    BINDS_READY.load(Ordering::Relaxed)
+                );
+            }
+
+            // 即使三个状态始终没有变化，也每 600 帧输出一次摘要。
+            // 这样可以确认插件仍在运行，以及 local_player 是否可用。
+            if tick % 600 == 0 {
+                log::info!(
+                    "crouch-kick diagnostic: \
+                     local_player={}, binds_ready={}, \
+                     wallrun={}, jump={}, crouch={}, speed={:.1}",
+                    player_available,
+                    BINDS_READY.load(Ordering::Relaxed),
+                    wr,
+                    jd,
+                    cd,
+                    spd
+                );
+            }
+        }
+
         let prev = f32::from_bits(PREV_SPEED.load(Ordering::Relaxed));
         PREV_SPEED.store(spd.to_bits(), Ordering::Relaxed);
 
@@ -495,7 +635,18 @@ impl Plugin for CrouchKickFix {
 
         // Push the kick into Squirrel AFTER releasing the STATE lock (still on the engine thread).
         if let Some((gain, wall_frame, crouch)) = kick_event {
+            if DEBUG_DETECTOR {
+                log::info!(
+                    "crouch-kick: kick detected; \
+                     gain={}, wall_frame={}, crouch={}",
+                    gain,
+                    wall_frame,
+                    crouch
+                );
+            }
+
             push_kick(t, gain, wall_frame, crouch);
+        }
         }
     }
 }
