@@ -66,8 +66,6 @@ const BIND_FAST_RETRY_LIMIT: u32 = 20;
 // Source 引擎 ButtonCode 的检查范围。
 const BUTTON_CODE_SCAN_LIMIT: i32 = 256;
 
-// 临时诊断开关。首次验证手柄适配时保持 true；确认正常后改为 false。
-const DEBUG_DETECTOR: bool = true;
 
 // 个人手柄布局中实测得到的原始 ButtonCode。
 const PAD_JUMP_CODE: i32 = 118;
@@ -77,18 +75,10 @@ const PAD_CROUCH_CODE: i32 = 115;
 static PAD_JUMP_DOWN: AtomicBool = AtomicBool::new(false);
 static PAD_CROUCH_DOWN: AtomicBool = AtomicBool::new(false);
 
-// 临时诊断：限制原始输入日志数量，防止日志无限增长。
-static RAW_INPUT_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-const RAW_INPUT_LOG_LIMIT: u32 = 200;
 
 static BINDS_READY: AtomicBool = AtomicBool::new(false);
 static BIND_RETRY_COUNT: AtomicU32 = AtomicU32::new(0);
 static NEXT_BIND_RETRY_TICK: AtomicU64 = AtomicU64::new(0);
-
-// 记录上一帧状态，只在状态发生变化时输出日志。
-static LAST_WR: AtomicBool = AtomicBool::new(false);
-static LAST_JD: AtomicBool = AtomicBool::new(false);
-static LAST_CD: AtomicBool = AtomicBool::new(false);
 
 
 // The buffer (the fix); pushed from the companion via CKF_SetOptions (ModSettings `ckf_enabled`).
@@ -330,19 +320,6 @@ unsafe extern "C" fn post_event_detour(
 
     let pressed = n_type == IE_BUTTON_PRESSED;
 
-    if DEBUG_DETECTOR {
-        let index = RAW_INPUT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if index < RAW_INPUT_LOG_LIMIT {
-            log::info!(
-                "crouch-kick raw input: type={}, tick={}, scan={}, virt={}, data3={}",
-                n_type,
-                n_tick,
-                scan,
-                virt,
-                data3
-            );
-        }
-    }
 
     let Some((btn, edge, input_code)) =
         classify_event(scan, virt, n_type)
@@ -364,26 +341,6 @@ unsafe extern "C" fn post_event_detour(
         PAD_CROUCH_DOWN.store(pressed, Ordering::Relaxed);
     }
 
-    if DEBUG_DETECTOR {
-        let button_name = match btn {
-            Btn::Jump => "jump",
-            Btn::Crouch => "crouch",
-        };
-
-        let edge_name = match edge {
-            Edge::Press => "press",
-            Edge::Release => "release",
-        };
-
-        log::info!(
-            "crouch-kick matched input: code={}, scan={}, virt={}, button={}, edge={}",
-            input_code,
-            scan,
-            virt,
-            button_name,
-            edge_name
-        );
-    }
 
     if !ENABLED.load(Ordering::Relaxed) {
         return pass(a); // buffer disabled -> pass jump/crouch through untouched
@@ -476,44 +433,31 @@ fn ckf_set_options(enabled: i32) {
     ENABLED.store(enabled != 0, Ordering::Relaxed);
 }
 
-/// Push a detected kick into the CLIENT VM by calling the companion's `CKF_OnKick`. Must run on
-/// the engine thread (called from runframe). No-op if the client VM / function isn't ready.
-fn push_kick(t: EngineToken, gain: i32, wall_frame: i32, crouch: bool) {
+/// Push a detected kick into the CLIENT VM by calling the companion's `CKF_OnKick`.
+/// Must run on the engine thread. If the CLIENT VM is not ready, silently skip.
+fn push_kick(
+    t: EngineToken,
+    gain: i32,
+    wall_frame: i32,
+    crouch: bool,
+) {
     let Some(sqvm) = *SQVM_CLIENT.get(t).borrow() else {
-        log::warn!(
-            "crouch-kick: feedback push failed — CLIENT Squirrel VM unavailable"
-        );
         return;
     };
 
     let Some(sqfns) = SQFUNCTIONS.client.get() else {
-        log::warn!(
-            "crouch-kick: feedback push failed — CLIENT SQFUNCTIONS unavailable"
-        );
         return;
     };
 
-    log::info!(
-        "crouch-kick: pushing feedback gain={} wall_frame={} crouch={}",
-        gain,
-        wall_frame,
-        crouch
-    );
-
-    let result = call_sq_function::<(), _>(
+    if let Err(e) = call_sq_function::<(), _>(
         sqvm,
         sqfns,
         "CKF_OnKick",
         (gain, wall_frame, crouch as i32),
-    );
-
-    if result.is_err() {
+    ) {
         log::error!(
-            "crouch-kick: CKF_OnKick Squirrel call failed"
-        );
-    } else {
-        log::info!(
-            "crouch-kick: CKF_OnKick Squirrel call succeeded"
+            "crouch-kick: CKF_OnKick Squirrel call failed: {:?}",
+            e
         );
     }
 }
@@ -573,18 +517,8 @@ impl Plugin for CrouchKickFix {
                 let table_readable = tf2_input::refresh();
 
                 if table_readable {
-                    if let Some((jump_key, crouch_key)) =
-                        find_required_binds()
-                    {
+                    if find_required_binds().is_some() {
                         BINDS_READY.store(true, Ordering::Relaxed);
-
-                        log::info!(
-                            "crouch-kick: required binds resolved; \
-                             jump_code={}, crouch_code={}, attempts={}",
-                            jump_key,
-                            crouch_key,
-                            attempt
-                        );
                     } else if attempt <= 5 || attempt % 10 == 0 {
                         log::warn!(
                             "crouch-kick: bind table readable, \
@@ -594,11 +528,11 @@ impl Plugin for CrouchKickFix {
                         );
                     }
                 } else if attempt <= 5 || attempt % 10 == 0 {
-                    log::warn!(
-                        "crouch-kick: input bind table not ready; \
-                         attempt={}",
-                        attempt
-                    );
+                        log::warn!(
+                            "crouch-kick: input bind table not ready; \
+                             attempt={}",
+                            attempt
+                        );
                 }
             }
         }
@@ -616,43 +550,6 @@ impl Plugin for CrouchKickFix {
         let cd = crouch_down();
         let spd = horiz_speed().unwrap_or(0.0);
 
-        // 只在状态变化时记录，避免每帧刷日志。
-        if DEBUG_DETECTOR {
-            let old_wr = LAST_WR.swap(wr, Ordering::Relaxed);
-            let old_jd = LAST_JD.swap(jd, Ordering::Relaxed);
-            let old_cd = LAST_CD.swap(cd, Ordering::Relaxed);
-
-            if old_wr != wr || old_jd != jd || old_cd != cd {
-                log::info!(
-                    "crouch-kick state changed: \
-                     wallrun={}, wall_frames={}, \
-                     jump={}, crouch={}, speed={:.1}, \
-                     binds_ready={}",
-                    wr,
-                    wf,
-                    jd,
-                    cd,
-                    spd,
-                    BINDS_READY.load(Ordering::Relaxed)
-                );
-            }
-
-            // 即使三个状态始终没有变化，也每 600 帧输出一次摘要。
-            // 这样可以确认插件仍在运行，以及 local_player 是否可用。
-            if tick % 600 == 0 {
-                log::info!(
-                    "crouch-kick diagnostic: \
-                     local_player={}, binds_ready={}, \
-                     wallrun={}, jump={}, crouch={}, speed={:.1}",
-                    player_available,
-                    BINDS_READY.load(Ordering::Relaxed),
-                    wr,
-                    jd,
-                    cd,
-                    spd
-                );
-            }
-        }
 
         let prev = f32::from_bits(PREV_SPEED.load(Ordering::Relaxed));
         PREV_SPEED.store(spd.to_bits(), Ordering::Relaxed);
@@ -707,16 +604,6 @@ impl Plugin for CrouchKickFix {
 
         // Push the kick into Squirrel AFTER releasing the STATE lock (still on the engine thread).
         if let Some((gain, wall_frame, crouch)) = kick_event {
-            if DEBUG_DETECTOR {
-                log::info!(
-                    "crouch-kick: kick detected; \
-                     gain={}, wall_frame={}, crouch={}",
-                    gain,
-                    wall_frame,
-                    crouch
-                );
-            }
-
             push_kick(t, gain, wall_frame, crouch);
         }
     }
