@@ -66,8 +66,20 @@ const BIND_FAST_RETRY_LIMIT: u32 = 20;
 // Source 引擎 ButtonCode 的检查范围。
 const BUTTON_CODE_SCAN_LIMIT: i32 = 256;
 
-// 临时诊断开关。排查完成后改为 false。
+// 临时诊断开关。首次验证手柄适配时保持 true；确认正常后改为 false。
 const DEBUG_DETECTOR: bool = true;
+
+// 个人手柄布局中实测得到的原始 ButtonCode。
+const PAD_JUMP_CODE: i32 = 118;
+const PAD_CROUCH_CODE: i32 = 115;
+
+// 单独维护手柄按键的物理保持状态。
+static PAD_JUMP_DOWN: AtomicBool = AtomicBool::new(false);
+static PAD_CROUCH_DOWN: AtomicBool = AtomicBool::new(false);
+
+// 临时诊断：限制原始输入日志数量，防止日志无限增长。
+static RAW_INPUT_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+const RAW_INPUT_LOG_LIMIT: u32 = 200;
 
 static BINDS_READY: AtomicBool = AtomicBool::new(false);
 static BIND_RETRY_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -78,19 +90,21 @@ static LAST_WR: AtomicBool = AtomicBool::new(false);
 static LAST_JD: AtomicBool = AtomicBool::new(false);
 static LAST_CD: AtomicBool = AtomicBool::new(false);
 
-// 临时诊断：限制原始输入日志数量，防止日志无限增长。
-static RAW_INPUT_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-const RAW_INPUT_LOG_LIMIT: u32 = 200;
 
 // The buffer (the fix); pushed from the companion via CKF_SetOptions (ModSettings `ckf_enabled`).
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// Held state by action (crouch = either crouch bind type).
+/// Held state by action.
+/// 键鼠继续由 tf2-input 维护；手柄使用固定 ButtonCode 的独立状态。
 fn jump_down() -> bool {
     tf2_input::is_down(Input::Jump)
+        || PAD_JUMP_DOWN.load(Ordering::Relaxed)
 }
+
 fn crouch_down() -> bool {
-    tf2_input::is_down(Input::Crouch) || tf2_input::is_down(Input::ToggleCrouch)
+    tf2_input::is_down(Input::Crouch)
+        || tf2_input::is_down(Input::ToggleCrouch)
+        || PAD_CROUCH_DOWN.load(Ordering::Relaxed)
 }
 /// Is this ButtonCode a jump / crouch key (for classifying buffered events)?
 fn is_jump_key(scan: i32) -> bool {
@@ -252,20 +266,42 @@ fn ei(e: Edge) -> usize {
     if e == Edge::Press { 0 } else { 1 }
 }
 
-/// Map an incoming event to (Btn, Edge) if it's a jump/crouch press/release.
-fn classify(scan: i32, n_type: i32) -> Option<(Btn, Edge)> {
+/// 将一个原始 ButtonCode 分类为 Jump 或 Crouch。
+/// 同时支持 tf2-input 解析出的键鼠绑定，以及个人手柄固定代码。
+fn classify_code(code: i32, n_type: i32) -> Option<(Btn, Edge)> {
     let edge = match n_type {
         IE_BUTTON_PRESSED => Edge::Press,
         IE_BUTTON_RELEASED => Edge::Release,
         _ => return None,
     };
-    if is_jump_key(scan) {
+
+    if is_jump_key(code) || code == PAD_JUMP_CODE {
         Some((Btn::Jump, edge))
-    } else if is_crouch_key(scan) {
+    } else if is_crouch_key(code) || code == PAD_CROUCH_CODE {
         Some((Btn::Crouch, edge))
     } else {
         None
     }
+}
+
+/// 同时检查 PostEvent 的 scan 与 virt 字段。
+/// 返回动作、边沿和实际匹配到的 ButtonCode。
+fn classify_event(
+    scan: i32,
+    virt: i32,
+    n_type: i32,
+) -> Option<(Btn, Edge, i32)> {
+    if let Some((btn, edge)) = classify_code(scan, n_type) {
+        return Some((btn, edge, scan));
+    }
+
+    if virt != scan {
+        if let Some((btn, edge)) = classify_code(virt, n_type) {
+            return Some((btn, edge, virt));
+        }
+    }
+
+    None
 }
 
 unsafe extern "C" fn post_event_detour(
@@ -279,20 +315,26 @@ unsafe extern "C" fn post_event_detour(
     let (Some(detour), Some(state_mx)) = (DETOUR.get(), STATE.get()) else {
         return 0;
     };
-    let pass = |ctx: usize| unsafe { detour.call(ctx, n_type, n_tick, scan, virt, data3) };
+    let pass = |ctx: usize| unsafe {
+        detour.call(ctx, n_type, n_tick, scan, virt, data3)
+    };
 
     let is_button_event =
         n_type == IE_BUTTON_PRESSED
         || n_type == IE_BUTTON_RELEASED;
 
-    if DEBUG_DETECTOR && is_button_event {
-        let index =
-            RAW_INPUT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    // 非按钮按下/松开事件不参与 CKF 处理。
+    if !is_button_event {
+        return pass(a);
+    }
 
+    let pressed = n_type == IE_BUTTON_PRESSED;
+
+    if DEBUG_DETECTOR {
+        let index = RAW_INPUT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
         if index < RAW_INPUT_LOG_LIMIT {
             log::info!(
-                "crouch-kick raw input: \
-                 type={}, tick={}, scan={}, virt={}, data3={}",
+                "crouch-kick raw input: type={}, tick={}, scan={}, virt={}, data3={}",
                 n_type,
                 n_tick,
                 scan,
@@ -301,16 +343,47 @@ unsafe extern "C" fn post_event_detour(
             );
         }
     }
-    // Feed physical key state to tf2-input (it tracks held-state by ButtonCode; kick detection
-    // reads is_down() by action in runframe — the press edges rarely coincide with the brief
-    // wall contact, but the held state does).
-    if n_type == IE_BUTTON_PRESSED || n_type == IE_BUTTON_RELEASED {
-        tf2_input::on_button_event(scan, n_type == IE_BUTTON_PRESSED);
-    }
 
-    let Some((btn, edge)) = classify(scan, n_type) else {
+    let Some((btn, edge, input_code)) =
+        classify_event(scan, virt, n_type)
+    else {
         return pass(a); // not jump/crouch press/release -> untouched
     };
+
+    // 对键鼠目标键，使用真正匹配到的 code 更新 tf2-input 状态。
+    // 对手柄 118/115，这个调用无害；实际动作状态由下方两个 AtomicBool 维护。
+    tf2_input::on_button_event(input_code, pressed);
+
+    // 独立维护手柄的物理保持状态。必须在 ENABLED 检查之前更新，
+    // 这样状态不会因为事件被缓冲或插件临时关闭而卡住。
+    if input_code == PAD_JUMP_CODE {
+        PAD_JUMP_DOWN.store(pressed, Ordering::Relaxed);
+    }
+
+    if input_code == PAD_CROUCH_CODE {
+        PAD_CROUCH_DOWN.store(pressed, Ordering::Relaxed);
+    }
+
+    if DEBUG_DETECTOR {
+        let button_name = match btn {
+            Btn::Jump => "jump",
+            Btn::Crouch => "crouch",
+        };
+
+        let edge_name = match edge {
+            Edge::Press => "press",
+            Edge::Release => "release",
+        };
+
+        log::info!(
+            "crouch-kick matched input: code={}, scan={}, virt={}, button={}, edge={}",
+            input_code,
+            scan,
+            virt,
+            button_name,
+            edge_name
+        );
+    }
 
     if !ENABLED.load(Ordering::Relaxed) {
         return pass(a); // buffer disabled -> pass jump/crouch through untouched
@@ -472,66 +545,63 @@ impl Plugin for CrouchKickFix {
             flush();
         }
 
-    // 只在进入地图、能够解析本地玩家之后读取绑定表。
-    // refresh() 返回 true 后，还需要确认 Jump/Crouch 已实际解析。
-    let player_available = local_player().is_some();
+        // 只在进入地图、能够解析本地玩家之后读取绑定表。
+        // refresh() 返回 true 后，还需要确认键鼠 Jump/Crouch 已实际解析。
+        // 手柄使用固定代码 118/115，不依赖这张绑定表。
+        let player_available = local_player().is_some();
 
-    if !BINDS_READY.load(Ordering::Relaxed)
-        && player_available
-    {
-        let next_retry_tick =
-            NEXT_BIND_RETRY_TICK.load(Ordering::Relaxed);
+        if !BINDS_READY.load(Ordering::Relaxed) && player_available {
+            let next_retry_tick =
+                NEXT_BIND_RETRY_TICK.load(Ordering::Relaxed);
 
-        if tick >= next_retry_tick {
-            let attempt =
-                BIND_RETRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if tick >= next_retry_tick {
+                let attempt =
+                    BIND_RETRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
-            let next_interval =
-                if attempt < BIND_FAST_RETRY_LIMIT {
-                    BIND_RETRY_INTERVAL
-                } else {
-                    BIND_SLOW_RETRY_INTERVAL
-                };
+                let next_interval =
+                    if attempt <= BIND_FAST_RETRY_LIMIT {
+                        BIND_RETRY_INTERVAL
+                    } else {
+                        BIND_SLOW_RETRY_INTERVAL
+                    };
 
-            NEXT_BIND_RETRY_TICK.store(
-                tick.saturating_add(next_interval),
-                Ordering::Relaxed,
-            );
+                NEXT_BIND_RETRY_TICK.store(
+                    tick.saturating_add(next_interval),
+                    Ordering::Relaxed,
+                );
 
-            let table_readable = tf2_input::refresh();
+                let table_readable = tf2_input::refresh();
 
-            if table_readable {
-                if let Some((jump_key, crouch_key)) =
-                    find_required_binds()
-                {
-                    BINDS_READY.store(true, Ordering::Relaxed);
+                if table_readable {
+                    if let Some((jump_key, crouch_key)) =
+                        find_required_binds()
+                    {
+                        BINDS_READY.store(true, Ordering::Relaxed);
 
-                    log::info!(
-                        "crouch-kick: required binds resolved; \
-                         jump_code={}, crouch_code={}, attempts={}",
-                        jump_key,
-                        crouch_key,
-                        attempt
-                    );
+                        log::info!(
+                            "crouch-kick: required binds resolved; \
+                             jump_code={}, crouch_code={}, attempts={}",
+                            jump_key,
+                            crouch_key,
+                            attempt
+                        );
+                    } else if attempt <= 5 || attempt % 10 == 0 {
+                        log::warn!(
+                            "crouch-kick: bind table readable, \
+                             but Jump/Crouch bindings are missing; \
+                             attempt={}",
+                            attempt
+                        );
+                    }
                 } else if attempt <= 5 || attempt % 10 == 0 {
                     log::warn!(
-                        "crouch-kick: bind table readable, \
-                         but Jump/Crouch bindings are missing; \
+                        "crouch-kick: input bind table not ready; \
                          attempt={}",
                         attempt
                     );
                 }
-            } else if attempt <= 5 || attempt % 10 == 0 {
-                log::warn!(
-                    "crouch-kick: input bind table not ready; \
-                     attempt={}",
-                    attempt
-                );
             }
         }
-    }
-
-
 
         // Wall contact this frame, from the RE'd wall-run flag.
         let wr = is_wallrunning();
