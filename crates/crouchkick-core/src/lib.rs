@@ -115,7 +115,7 @@ impl Buffer {
             .map(|(_, btn, edge)| (btn, edge))
             .collect()
     }
-
+}
 #[cfg(test)]
 mod tests {
     use super::*;
